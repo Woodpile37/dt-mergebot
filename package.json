@@ -16,7 +16,7 @@
     "node": ">=14.16.1"
   },
   "dependencies": {
-    "@apollo/client": "^3.3.6",
+    "@apollo/client": "^3.7.9",
     "@definitelytyped/header-parser": "^0.0.64",
     "@octokit/webhooks": "^9.5.1",
     "dayjs": "^1.10.3",
