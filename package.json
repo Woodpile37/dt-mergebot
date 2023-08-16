@@ -17,12 +17,12 @@
   },
   "dependencies": {
     "@apollo/client": "^3.3.6",
-    "@definitelytyped/header-parser": "^0.0.64",
+    "@definitelytyped/header-parser": "^0.0.150",
     "@octokit/webhooks": "^9.5.1",
     "dayjs": "^1.10.3",
-    "fast-json-patch": "^3.0.0-1",
+    "fast-json-patch": "^3.1.1",
     "fs-extra": "^9.0.1",
-    "graphql": "14.7.0",
+    "graphql": "16.6.0",
     "node-fetch": "^2.6.1",
     "prettyjson": "^1.2.1",
     "yargs": "^17.0.1"
@@ -30,10 +30,10 @@
   "devDependencies": {
     "@azure/functions": "^1.2.2",
     "@endemolshinegroup/cosmiconfig-typescript-loader": "^3.0.2",
-    "@octokit/graphql-schema": "^10.11.0",
+    "@octokit/graphql-schema": "^13.5.0",
     "@types/fs-extra": "^4.0.11",
     "@types/jest": "^26.0.20",
-    "@types/node": "latest",
+    "@types/node": "18.14.2",
     "@types/node-fetch": "^2.5.7",
     "@types/prettyjson": "^0.0.29",
     "@typescript-eslint/eslint-plugin": "^5.54.0",
