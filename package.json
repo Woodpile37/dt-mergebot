@@ -32,7 +32,7 @@
     "@endemolshinegroup/cosmiconfig-typescript-loader": "^3.0.2",
     "@octokit/graphql-schema": "^13.5.0",
     "@types/fs-extra": "^4.0.11",
-    "@types/jest": "^26.0.20",
+    "@types/jest": "^29.5.3",
     "@types/node": "18.15.0",
     "@types/node-fetch": "^2.5.7",
     "@types/prettyjson": "^0.0.29",
