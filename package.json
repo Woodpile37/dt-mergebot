@@ -25,7 +25,7 @@
     "graphql": "16.6.0",
     "node-fetch": "^3.3.2",
     "prettyjson": "^1.2.1",
-    "yargs": "^17.0.1"
+    "yargs": "^17.7.2"
   },
   "devDependencies": {
     "@azure/functions": "^1.2.2",
