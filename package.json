@@ -31,7 +31,7 @@
     "@azure/functions": "^3.5.1",
     "@endemolshinegroup/cosmiconfig-typescript-loader": "^3.0.2",
     "@octokit/graphql-schema": "^13.5.0",
-    "@types/fs-extra": "^4.0.11",
+    "@types/fs-extra": "^11.0.2",
     "@types/jest": "^29.5.3",
     "@types/node": "18.15.0",
     "@types/node-fetch": "^3.0.2",
