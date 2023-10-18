@@ -30,7 +30,7 @@
   "devDependencies": {
     "@azure/functions": "^3.5.1",
     "@endemolshinegroup/cosmiconfig-typescript-loader": "^3.0.2",
-    "@octokit/graphql-schema": "^14.32.1",
+    "@octokit/graphql-schema": "^14.33.0",
     "@types/fs-extra": "^11.0.2",
     "@types/jest": "^29.5.3",
     "@types/node": "20.6.5",
