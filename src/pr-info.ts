@@ -1,13 +1,17 @@
-import { ColumnName, PopularityLevel } from "./basic";
-import { PR_repository_pullRequest,
+import { GetPRInfo } from "./queries/pr-query";
+import { PR_repository_pullRequest as GraphqlPullRequest,
+         PR_repository_pullRequest,
          PR_repository_pullRequest_commits_nodes_commit_checkSuites,
          PR_repository_pullRequest_timelineItems,
+         PR_repository_pullRequest_timelineItems_nodes_ReopenedEvent,
+         PR_repository_pullRequest_timelineItems_nodes_ReadyForReviewEvent,
+         PR_repository_pullRequest_timelineItems_nodes_MovedColumnsInProjectEvent,
          PR_repository_pullRequest_comments_nodes,
 } from "./queries/schema/PR";
 import { getMonthlyDownloadCount } from "./util/npm";
+import { client } from "./graphql-client";
 import { fetchFile as defaultFetchFile } from "./util/fetchFile";
-import { noNullish, someLast, sameUser, authorNotBot, max, abbrOid } from "./util/util";
-import { TOO_MANY_FILES } from "./queries/pr-query";
+import { noNullish, findLast, sameUser, authorNotBot, max, abbrOid } from "./util/util";
 import * as comment from "./util/comment";
 import * as urls from "./urls";
 import * as HeaderParser from "@definitelytyped/header-parser";
@@ -15,6 +19,11 @@ import * as jsonDiff from "fast-json-patch";
 
 const CriticalPopularityThreshold = 5_000_000;
 const NormalPopularityThreshold = 200_000;
+
+export type PopularityLevel =
+    | "Well-liked by everyone"
+    | "Popular"
+    | "Critical";
 
 // Some error found, will be passed to `process` to report in a comment
 interface BotError {
@@ -75,11 +84,6 @@ export interface PrInfo {
     readonly headCommitOid: string;
 
     /**
-     * merge-base-like commit for config comparisons (see getBaseId() below)
-     */
-    readonly mergeBaseOid: string;
-
-    /**
      * The GitHub login of the PR author
      */
     readonly author: string;
@@ -93,11 +97,6 @@ export interface PrInfo {
      * A link to the log for the failing CI if it exists
      */
     readonly ciUrl?: string;
-
-    /**
-     * An ID for a check suite which could need re-running
-     */
-    readonly reRunCheckSuiteIDs?: number[];
 
     /**
      * True if the PR has a merge conflict
@@ -115,9 +114,9 @@ export interface PrInfo {
     readonly lastActivityDate: Date;
 
     /**
-     * Name of column used if a maintainer blessed this PR
+     * True if a maintainer blessed this PR
      */
-    readonly maintainerBlessed?: ColumnName;
+    readonly maintainerBlessed: boolean;
 
     /**
      * The time we posted a merge offer, if any (required for merge request in addition to passing CI and a review)
@@ -132,23 +131,11 @@ export interface PrInfo {
 
     readonly isFirstContribution: boolean;
 
-    /*
-     * True if there are more files than we can fetch from the initial query (or no files)
-     */
-    readonly tooManyFiles: boolean;
-    /*
-     * True for PRs with over 5k line changes (top ~3%)
-     */
-    readonly hugeChange: boolean;
-
     readonly popularityLevel: PopularityLevel;
 
     readonly pkgInfo: readonly PackageInfo[];
 
     readonly reviews: readonly ReviewInfo[];
-
-    // The ID of the main comment so that it can be linked to by other comments
-    readonly mainBotCommentID?: number;
 }
 
 export type BotResult =
@@ -156,25 +143,36 @@ export type BotResult =
     | BotError
     | BotEnsureRemovedFromProject;
 
-function getHeadCommit(pr: PR_repository_pullRequest) {
+function getHeadCommit(pr: GraphqlPullRequest) {
     return pr.commits.nodes?.find(c => c?.commit.oid === pr.headRefOid)?.commit;
 }
-function getBaseId(pr: PR_repository_pullRequest): string | undefined {
-    // Finds a revision to compare config files against (similar to git merge-base, but simple (linear
-    // history on master, assume sane merges at most): finds the most recent sha1 that is not part of
-    // the PR -- not too reliable, but better than always using "master").
-    const nodes = pr.commitIds.nodes;
-    if (!nodes) return;
-    const prCommits = noNullish(nodes.map(node => node?.commit.oid));
-    if (!prCommits.length) return;
-    for (const node of nodes.slice(0).reverse()) {
-        const parents = node?.commit.parents.nodes;
-        if (!parents) continue;
-        for (const parent of parents) {
-            if (parent?.oid && !prCommits.includes(parent.oid)) return parent.oid;
+
+// Just the networking
+export async function queryPRInfo(prNumber: number) {
+    // The query can return a mergeable value of `UNKNOWN`, and then it takes a
+    // while to get the actual value while GH refreshes the state (verified
+    // with GH that this is expected).  So implement a simple retry thing to
+    // get a proper value, or return a useless one if giving up.
+    let retries = 0;
+    while (true) {
+        const info = await client.query({
+            query: GetPRInfo,
+            variables: { pr_number: prNumber },
+            fetchPolicy: "no-cache",
+        });
+        const prInfo = info.data.repository?.pullRequest;
+        if (!prInfo) return info; // let `deriveStateForPR` handle the missing result
+        if (!(prInfo.state === "OPEN" && prInfo.mergeable === "UNKNOWN")) return info;
+        const { nodes, totalCount } = prInfo.files!;
+        if (nodes!.length < totalCount) console.warn(`  *** Note: ${totalCount - nodes!.length} files were not seen by this query!`);
+        if (++retries > 5) { // we already did 5 tries, so give up and...
+            info.data.repository = null;
+            return info; // ...return a bad result to avoid using the bogus information
         }
+        // wait 3N..3N+1 seconds (based on trial runs: it usually works after one wait)
+        const wait = 1000 * (Math.random() + 3 * retries);
+        await new Promise(resolve => setTimeout(resolve, wait));
     }
-    return;
 }
 
 // The GQL response => Useful data for us
@@ -191,7 +189,6 @@ export async function deriveStateForPR(
 
     const headCommit = getHeadCommit(prInfo);
     if (headCommit == null) return botError("No head commit found");
-    const baseId = getBaseId(prInfo) || "master";
 
     const author = prInfo.author.login;
     const isFirstContribution = prInfo.authorAssociation === "FIRST_TIME_CONTRIBUTOR";
@@ -201,24 +198,12 @@ export async function deriveStateForPR(
     // (it would be bad to use `committedDate`/`authoredDate`, since these can be set to arbitrary values)
     const lastPushDate = new Date(headCommit.pushedDate || prInfo.createdAt);
     const lastCommentDate = getLastCommentishActivityDate(prInfo);
-    const blessing = getLastMaintainerBlessing(lastPushDate, prInfo.timelineItems);
+    const lastBlessing = getLastMaintainerBlessingDate(prInfo.timelineItems);
     const reopenedDate = getReopenedDate(prInfo.timelineItems);
-    // we should generally have all files (except for draft PRs)
-    const fileCount = prInfo.changedFiles;
-    // we fetch all files so this shouldn't happen, but GH has a limit of 3k files even with
-    // pagination (docs.github.com/en/rest/reference/pulls#list-pull-requests-files) and in
-    // that case `files.totalCount` would be 3k so it'd fit the count but `changedFiles` would
-    // be correct; so to be safe: check it, and warn if there are many files (or zero)
-    const tooManyFiles = !fileCount // should never happen, make it look fishy if it does
-        || fileCount > TOO_MANY_FILES // suspiciously many files
-        || fileCount !== prInfo.files?.nodes?.length; // didn't get all files (probably too many)
-    const hugeChange = prInfo.additions + prInfo.deletions > 5000;
 
-    const paths = noNullish(prInfo.files?.nodes).map(f => f.path).sort();
-    if (paths.length > TOO_MANY_FILES) paths.length = TOO_MANY_FILES; // redundant, but just in case
     const pkgInfoEtc = await getPackageInfosEtc(
-        paths, prInfo.headRefOid, baseId,
-        fetchFile, async name => await getDownloads(name, lastPushDate));
+        noNullish(prInfo.files?.nodes).map(f => f.path).sort(),
+        prInfo.headRefOid, fetchFile, async name => await getDownloads(name, lastPushDate));
     if (pkgInfoEtc instanceof Error) return botError(pkgInfoEtc.message);
     const { pkgInfo, popularityLevel } = pkgInfoEtc;
 
@@ -227,28 +212,24 @@ export async function deriveStateForPR(
     const comments = noNullish(prInfo.comments.nodes);
     const mergeOfferDate = getMergeOfferDate(comments, prInfo.headRefOid);
     const mergeRequest = getMergeRequest(comments,
-                                         pkgInfo.filter(p => p.name).length === 1 ? [author, ...pkgInfo.find(p => p.name)!.owners] : [author],
+                                         pkgInfo.length === 1 ? [author, ...pkgInfo[0]!.owners] : [author],
                                          max([createdDate, reopenedDate, lastPushDate]));
-    const lastActivityDate = max([createdDate, lastPushDate, lastCommentDate, blessing?.date, reopenedDate, latestReview]);
-    const mainBotCommentID = getMainCommentID(comments);
+    const lastActivityDate = max([createdDate, lastPushDate, lastCommentDate, lastBlessing, reopenedDate, latestReview]);
+
     return {
         type: "info",
         now,
         pr_number: prInfo.number,
         author,
         headCommitOid: prInfo.headRefOid,
-        mergeBaseOid: baseId, // not needed, kept for debugging
         lastPushDate, lastActivityDate,
-        maintainerBlessed: blessing?.column,
+        maintainerBlessed: lastBlessing ? lastBlessing > lastPushDate : false,
         mergeOfferDate, mergeRequestDate: mergeRequest?.date, mergeRequestUser: mergeRequest?.user,
         hasMergeConflict: prInfo.mergeable === "CONFLICTING",
         isFirstContribution,
-        tooManyFiles,
-        hugeChange,
         popularityLevel,
         pkgInfo,
         reviews,
-        mainBotCommentID,
         ...getCIResult(headCommit.checkSuites),
     };
 
@@ -261,18 +242,16 @@ export async function deriveStateForPR(
     }
 }
 
+type ReopenedEvent = PR_repository_pullRequest_timelineItems_nodes_ReopenedEvent;
+type ReadyForReviewEvent = PR_repository_pullRequest_timelineItems_nodes_ReadyForReviewEvent;
+
 /** Either: when the PR was last opened, or switched to ready from draft */
 function getReopenedDate(timelineItems: PR_repository_pullRequest_timelineItems) {
-    return someLast(timelineItems.nodes, item => (
-        (item.__typename === "ReopenedEvent" || item.__typename === "ReadyForReviewEvent")
-        && new Date(item.createdAt)))
-        || undefined;
-}
+    const lastItem = findLast(timelineItems.nodes, (item): item is ReopenedEvent | ReadyForReviewEvent => (
+        item?.__typename === "ReopenedEvent" || item?.__typename === "ReadyForReviewEvent"
+    ));
 
-function getMainCommentID(comments: PR_repository_pullRequest_comments_nodes[]) {
-    const comment = comments.find(c => !authorNotBot(c) && c.body.includes("<!--typescript_bot_welcome-->"));
-    if (!comment) return undefined;
-    return comment.databaseId!;
+    return lastItem?.createdAt && new Date(lastItem.createdAt);
 }
 
 function getLastCommentishActivityDate(prInfo: PR_repository_pullRequest) {
@@ -284,28 +263,34 @@ function getLastCommentishActivityDate(prInfo: PR_repository_pullRequest) {
     return max([...latestIssueCommentDate, ...latestReviewCommentDate]);
 }
 
-function getLastMaintainerBlessing(after: Date, timelineItems: PR_repository_pullRequest_timelineItems) {
-    return someLast(timelineItems.nodes, item => {
-        if (!(item.__typename === "MovedColumnsInProjectEvent" && authorNotBot(item))) return undefined;
-        const d = new Date(item.createdAt);
-        if (d <= after) return undefined;
-        return { date: d, column: item.projectColumnName as ColumnName };
-    }) || undefined;
+type MovedColumnsInProjectEvent = PR_repository_pullRequest_timelineItems_nodes_MovedColumnsInProjectEvent;
+function getLastMaintainerBlessingDate(timelineItems: PR_repository_pullRequest_timelineItems) {
+    const lastColumnChange = findLast(timelineItems.nodes, (item): item is MovedColumnsInProjectEvent =>
+        item?.__typename === "MovedColumnsInProjectEvent" && authorNotBot(item!));
+    // ------------------------------ TODO ------------------------------
+    // Should add and use the `previousProjectColumnName` field to
+    // verify that the move was away from "Needs Maintainer Review", but
+    // that is still in beta ATM.
+    // ------------------------------ TODO ------------------------------
+    if (lastColumnChange) {
+        return new Date(lastColumnChange.createdAt);
+    }
+    return undefined;
 }
 
 async function getPackageInfosEtc(
-    paths: string[], headId: string, baseId: string, fetchFile: typeof defaultFetchFile, getDownloads: typeof getMonthlyDownloadCount
+    paths: string[], headId: string, fetchFile: typeof defaultFetchFile, getDownloads: typeof getMonthlyDownloadCount
 ): Promise<{pkgInfo: PackageInfo[], popularityLevel: PopularityLevel} | Error> {
     const infos = new Map<string|null, FileInfo[]>();
     for (const path of paths) {
-        const [pkg, fileInfo] = await categorizeFile(path, headId, baseId, fetchFile);
+        const [pkg, fileInfo] = await categorizeFile(path, async (oid: string = headId) => fetchFile(`${oid}:${path}`));
         if (!infos.has(pkg)) infos.set(pkg, []);
         infos.get(pkg)!.push(fileInfo);
     }
     const result: PackageInfo[] = [];
     let maxDownloads = 0;
     for (const [name, files] of infos) {
-        const oldOwners = !name ? null : await getOwnersOfPackage(name, baseId, fetchFile);
+        const oldOwners = !name ? null : await getOwnersOfPackage(name, "master", fetchFile);
         if (oldOwners instanceof Error) return oldOwners;
         const newOwners0 = !name ? null
             : !paths.includes(`types/${name}/index.d.ts`) ? oldOwners
@@ -333,8 +318,7 @@ async function getPackageInfosEtc(
     return { pkgInfo: result, popularityLevel: downloadsToPopularityLevel(maxDownloads) };
 }
 
-async function categorizeFile(path: string, newId: string, oldId: string,
-                              fetchFile: typeof defaultFetchFile): Promise<[string|null, FileInfo]> {
+async function categorizeFile(path: string, contents: (oid?: string) => Promise<string | undefined>): Promise<[string|null, FileInfo]> {
     // https://regex101.com/r/eFvtrz/1
     const match = /^types\/(.*?)\/.*?[^\/](?:\.(d\.ts|tsx?|md))?$/.exec(path);
     if (!match) return [null, { path, kind: "infrastructure" }];
@@ -345,27 +329,26 @@ async function categorizeFile(path: string, newId: string, oldId: string,
         case "ts": case "tsx": return [pkg, { path, kind: "test" }];
         case "md": return [pkg, { path, kind: "markdown" }];
         default: {
-            const contentGetter = (oid: string) => async () => fetchFile(`${oid}:${path}`);
-            const suspect = await configSuspicious(path, contentGetter(newId), contentGetter(oldId));
+            const suspect = await configSuspicious(path, contents);
             return [pkg, { path, kind: suspect ? "package-meta" : "package-meta-ok", suspect }];
         }
     }
 }
 
 interface ConfigSuspicious {
-    (path: string, getNew: () => Promise<string | undefined>, getOld: () => Promise<string | undefined>): Promise<string | undefined>;
+    (path: string, getContents: (oid?: string) => Promise<string | undefined>): Promise<string | undefined>;
     [basename: string]: (text: string, oldText?: string) => string | undefined;
 }
-const configSuspicious = <ConfigSuspicious>(async (path, newContents, oldContents) => {
+const configSuspicious = <ConfigSuspicious>(async (path, getContents) => {
     const basename = path.replace(/.*\//, "");
     const checker = configSuspicious[basename];
     if (!checker) return `edited`;
-    const text = await newContents();
+    const text = await getContents();
     // Removing tslint.json, tsconfig.json, package.json and
     // OTHER_FILES.txt is checked by the CI. Specifics are in my commit
     // message.
     if (text === undefined) return undefined;
-    const oldText = await oldContents();
+    const oldText = await getContents("master");
     return checker(text, oldText);
 });
 configSuspicious["OTHER_FILES.txt"] = makeChecker(
@@ -383,12 +366,13 @@ configSuspicious["package.json"] = makeChecker(
     } }
 );
 configSuspicious["tslint.json"] = makeChecker(
-    { extends: "@definitelytyped/dtslint/dt.json" },
+    { extends: "dtslint/dt.json" },
     urls.linterJson
 );
 configSuspicious["tsconfig.json"] = makeChecker(
     {
         compilerOptions: {
+            module: "commonjs",
             lib: ["es6"],
             noImplicitAny: true,
             noImplicitThis: true,
@@ -401,14 +385,10 @@ configSuspicious["tsconfig.json"] = makeChecker(
     },
     urls.tsconfigJson,
     { ignore: data => {
-        if (Array.isArray(data.compilerOptions?.lib)) {
-            data.compilerOptions.lib = data.compilerOptions.lib.filter((value: unknown) =>
-                !(typeof value === "string" && value.toLowerCase() === "dom"));
-        }
-        ["baseUrl", "typeRoots", "paths", "jsx", "module"].forEach(k => delete data.compilerOptions[k]);
-        if (typeof data.compilerOptions?.target === "string" && data.compilerOptions.target.toLowerCase() === "es6") {
-            delete data.compilerOptions.target;
-        }
+        data.compilerOptions.lib = data.compilerOptions.lib.filter((value: unknown) => value !== "dom");
+        delete data.compilerOptions.baseUrl;
+        delete data.compilerOptions.typeRoots;
+        delete data.compilerOptions.paths;
         delete data.files;
     } }
 );
@@ -432,13 +412,11 @@ function makeChecker(expectedForm: any, expectedFormUrl: string, options?: { par
         const newDiff = diffFromExpected(contents);
         if (typeof newDiff === "string") return newDiff;
         if (newDiff.length === 0) return undefined;
-        const diffDescription = newDiff.every(d => /^\/[0-9]+($|\/)/.test(d.path)) ? ""
-            : ` (check: ${newDiff.map(d => `\`${d.path.slice(1).replace(/\//g, ".")}\``).join(", ")})`;
-        if (!oldText) return `not ${theExpectedForm}${diffDescription}`;
+        if (!oldText) return `not ${theExpectedForm}`;
         const oldDiff = diffFromExpected(oldText);
         if (typeof oldDiff === "string") return oldDiff;
         if (jsonDiff.compare(oldDiff, newDiff).every(({ op }) => op === "remove")) return undefined;
-        return `not ${theExpectedForm} and not moving towards it${diffDescription}`;
+        return `not ${theExpectedForm} and not moving towards it`;
     };
 }
 
@@ -457,10 +435,10 @@ function getMergeOfferDate(comments: PR_repository_pullRequest_comments_nodes[],
 function getMergeRequest(comments: PR_repository_pullRequest_comments_nodes[], users: string[], sinceDate: Date) {
     const request = latestComment(comments.filter(comment =>
         users.some(u => comment.author && sameUser(u, comment.author.login))
-        && comment.body.split("\n").some(line => line.trim().toLowerCase().startsWith("ready to merge"))));
+        && comment.body.trim().toLowerCase().startsWith("ready to merge")));
     if (!request) return request;
     const date = new Date(request.createdAt);
-    return date > sinceDate ? { date, user: request.author!.login } : undefined;
+    return date > sinceDate ? { date, user: request.author!.login  } : undefined;
 }
 
 function getReviews(prInfo: PR_repository_pullRequest) {
@@ -494,19 +472,16 @@ function getReviews(prInfo: PR_repository_pullRequest) {
     return reviews;
 }
 
-function getCIResult(checkSuites: PR_repository_pullRequest_commits_nodes_commit_checkSuites | null): { ciResult: CIResult, ciUrl?: string, reRunCheckSuiteIDs?: number[] } {
+function getCIResult(checkSuites: PR_repository_pullRequest_commits_nodes_commit_checkSuites | null): { ciResult: CIResult, ciUrl?: string } {
     const ghActionsChecks = checkSuites?.nodes?.filter(check => check?.app?.name.includes("GitHub Actions"));
-
-    // Freakin' crypto miners ruined GitHub Actions, and now we need to manually confirm new folks can run CI
-    const actionRequiredIDs = noNullish(ghActionsChecks?.map(check =>
-        check?.conclusion === "ACTION_REQUIRED" ? check.databaseId : null));
-    if (actionRequiredIDs.length > 0)
-        return { ciResult: "action_required", reRunCheckSuiteIDs: actionRequiredIDs };
-
     // Now that there is more than one GitHub Actions suite, we need to get the right one, but naively fall back
     // to the first if we can't find it, mostly to prevent breaking old tests.
     const totalStatusChecks = ghActionsChecks?.find(check => check?.checkRuns?.nodes?.[0]?.title === "test") || ghActionsChecks?.[0];
     if (!totalStatusChecks) return { ciResult: "missing", ciUrl: undefined };
+
+    // Freakin' crypto miners ruined GitHub Actions, and now we need to manually confirm new folks can run CI
+    const anyAreActionRequired = ghActionsChecks?.find(check => check?.conclusion === "ACTION_REQUIRED");
+    if (anyAreActionRequired) return { ciResult: "action_required" };
 
     switch (totalStatusChecks.conclusion) {
         case "SUCCESS":
@@ -526,8 +501,8 @@ function downloadsToPopularityLevel(monthlyDownloads: number): PopularityLevel {
         : "Well-liked by everyone";
 }
 
-export async function getOwnersOfPackage(packageName: string, oid: string, fetchFile: typeof defaultFetchFile): Promise<string[] | null | Error> {
-    const indexDts = `${oid}:types/${packageName}/index.d.ts`;
+async function getOwnersOfPackage(packageName: string, version: string, fetchFile: typeof defaultFetchFile): Promise<string[] | null | Error> {
+    const indexDts = `${version}:types/${packageName}/index.d.ts`;
     const indexDtsContent = await fetchFile(indexDts, 10240); // grab at most 10k
     if (indexDtsContent === undefined) return null;
     let parsed: HeaderParser.Header;
