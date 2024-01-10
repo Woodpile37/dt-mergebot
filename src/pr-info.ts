@@ -7,10 +7,9 @@ import { PR_repository_pullRequest,
 import { getMonthlyDownloadCount } from "./util/npm";
 import { fetchFile as defaultFetchFile } from "./util/fetchFile";
 import { noNullish, someLast, sameUser, authorNotBot, max, abbrOid } from "./util/util";
-import { TOO_MANY_FILES } from "./queries/pr-query";
 import * as comment from "./util/comment";
 import * as urls from "./urls";
-import * as OldHeaderParser from "@definitelytyped/old-header-parser";
+import * as HeaderParser from "@definitelytyped/header-parser";
 import * as jsonDiff from "fast-json-patch";
 
 const CriticalPopularityThreshold = 5_000_000;
@@ -75,11 +74,6 @@ export interface PrInfo {
     readonly headCommitOid: string;
 
     /**
-     * merge-base-like commit for config comparisons (see getBaseId() below)
-     */
-    readonly mergeBaseOid: string;
-
-    /**
      * The GitHub login of the PR author
      */
     readonly author: string;
@@ -136,10 +130,6 @@ export interface PrInfo {
      * True if there are more files than we can fetch from the initial query (or no files)
      */
     readonly tooManyFiles: boolean;
-    /*
-     * True for PRs with over 5k line changes (top ~3%)
-     */
-    readonly hugeChange: boolean;
 
     readonly popularityLevel: PopularityLevel;
 
@@ -159,23 +149,6 @@ export type BotResult =
 function getHeadCommit(pr: PR_repository_pullRequest) {
     return pr.commits.nodes?.find(c => c?.commit.oid === pr.headRefOid)?.commit;
 }
-function getBaseId(pr: PR_repository_pullRequest): string | undefined {
-    // Finds a revision to compare config files against (similar to git merge-base, but simple (linear
-    // history on master, assume sane merges at most): finds the most recent sha1 that is not part of
-    // the PR -- not too reliable, but better than always using "master").
-    const nodes = pr.commitIds.nodes;
-    if (!nodes) return;
-    const prCommits = noNullish(nodes.map(node => node?.commit.oid));
-    if (!prCommits.length) return;
-    for (const node of nodes.slice(0).reverse()) {
-        const parents = node?.commit.parents.nodes;
-        if (!parents) continue;
-        for (const parent of parents) {
-            if (parent?.oid && !prCommits.includes(parent.oid)) return parent.oid;
-        }
-    }
-    return;
-}
 
 // The GQL response => Useful data for us
 export async function deriveStateForPR(
@@ -191,7 +164,6 @@ export async function deriveStateForPR(
 
     const headCommit = getHeadCommit(prInfo);
     if (headCommit == null) return botError("No head commit found");
-    const baseId = getBaseId(prInfo) || "master";
 
     const author = prInfo.author.login;
     const isFirstContribution = prInfo.authorAssociation === "FIRST_TIME_CONTRIBUTOR";
@@ -210,15 +182,12 @@ export async function deriveStateForPR(
     // that case `files.totalCount` would be 3k so it'd fit the count but `changedFiles` would
     // be correct; so to be safe: check it, and warn if there are many files (or zero)
     const tooManyFiles = !fileCount // should never happen, make it look fishy if it does
-        || fileCount > TOO_MANY_FILES // suspiciously many files
-        || fileCount !== prInfo.files?.nodes?.length; // didn't get all files (probably too many)
-    const hugeChange = prInfo.additions + prInfo.deletions > 5000;
+        || fileCount !== prInfo.files?.nodes?.length // didn't get all files somehow
+        || fileCount > 500; // suspiciously many files
 
-    const paths = noNullish(prInfo.files?.nodes).map(f => f.path).sort();
-    if (paths.length > TOO_MANY_FILES) paths.length = TOO_MANY_FILES; // redundant, but just in case
     const pkgInfoEtc = await getPackageInfosEtc(
-        paths, prInfo.headRefOid, baseId,
-        fetchFile, async name => await getDownloads(name, lastPushDate));
+        noNullish(prInfo.files?.nodes).map(f => f.path).sort(),
+        prInfo.headRefOid, fetchFile, async name => await getDownloads(name, lastPushDate));
     if (pkgInfoEtc instanceof Error) return botError(pkgInfoEtc.message);
     const { pkgInfo, popularityLevel } = pkgInfoEtc;
 
@@ -227,7 +196,7 @@ export async function deriveStateForPR(
     const comments = noNullish(prInfo.comments.nodes);
     const mergeOfferDate = getMergeOfferDate(comments, prInfo.headRefOid);
     const mergeRequest = getMergeRequest(comments,
-                                         pkgInfo.filter(p => p.name).length === 1 ? [author, ...pkgInfo.find(p => p.name)!.owners] : [author],
+                                         pkgInfo.length === 1 ? [author, ...pkgInfo[0]!.owners] : [author],
                                          max([createdDate, reopenedDate, lastPushDate]));
     const lastActivityDate = max([createdDate, lastPushDate, lastCommentDate, blessing?.date, reopenedDate, latestReview]);
     const mainBotCommentID = getMainCommentID(comments);
@@ -237,14 +206,12 @@ export async function deriveStateForPR(
         pr_number: prInfo.number,
         author,
         headCommitOid: prInfo.headRefOid,
-        mergeBaseOid: baseId, // not needed, kept for debugging
         lastPushDate, lastActivityDate,
         maintainerBlessed: blessing?.column,
         mergeOfferDate, mergeRequestDate: mergeRequest?.date, mergeRequestUser: mergeRequest?.user,
         hasMergeConflict: prInfo.mergeable === "CONFLICTING",
         isFirstContribution,
         tooManyFiles,
-        hugeChange,
         popularityLevel,
         pkgInfo,
         reviews,
@@ -294,18 +261,18 @@ function getLastMaintainerBlessing(after: Date, timelineItems: PR_repository_pul
 }
 
 async function getPackageInfosEtc(
-    paths: string[], headId: string, baseId: string, fetchFile: typeof defaultFetchFile, getDownloads: typeof getMonthlyDownloadCount
+    paths: string[], headId: string, fetchFile: typeof defaultFetchFile, getDownloads: typeof getMonthlyDownloadCount
 ): Promise<{pkgInfo: PackageInfo[], popularityLevel: PopularityLevel} | Error> {
     const infos = new Map<string|null, FileInfo[]>();
     for (const path of paths) {
-        const [pkg, fileInfo] = await categorizeFile(path, headId, baseId, fetchFile);
+        const [pkg, fileInfo] = await categorizeFile(path, async (oid: string = headId) => fetchFile(`${oid}:${path}`));
         if (!infos.has(pkg)) infos.set(pkg, []);
         infos.get(pkg)!.push(fileInfo);
     }
     const result: PackageInfo[] = [];
     let maxDownloads = 0;
     for (const [name, files] of infos) {
-        const oldOwners = !name ? null : await getOwnersOfPackage(name, baseId, fetchFile);
+        const oldOwners = !name ? null : await getOwnersOfPackage(name, "master", fetchFile);
         if (oldOwners instanceof Error) return oldOwners;
         const newOwners0 = !name ? null
             : !paths.includes(`types/${name}/index.d.ts`) ? oldOwners
@@ -333,8 +300,7 @@ async function getPackageInfosEtc(
     return { pkgInfo: result, popularityLevel: downloadsToPopularityLevel(maxDownloads) };
 }
 
-async function categorizeFile(path: string, newId: string, oldId: string,
-                              fetchFile: typeof defaultFetchFile): Promise<[string|null, FileInfo]> {
+async function categorizeFile(path: string, contents: (oid?: string) => Promise<string | undefined>): Promise<[string|null, FileInfo]> {
     // https://regex101.com/r/eFvtrz/1
     const match = /^types\/(.*?)\/.*?[^\/](?:\.(d\.ts|tsx?|md))?$/.exec(path);
     if (!match) return [null, { path, kind: "infrastructure" }];
@@ -345,34 +311,50 @@ async function categorizeFile(path: string, newId: string, oldId: string,
         case "ts": case "tsx": return [pkg, { path, kind: "test" }];
         case "md": return [pkg, { path, kind: "markdown" }];
         default: {
-            const contentGetter = (oid: string) => async () => fetchFile(`${oid}:${path}`);
-            const suspect = await configSuspicious(path, contentGetter(newId), contentGetter(oldId));
+            const suspect = await configSuspicious(path, contents);
             return [pkg, { path, kind: suspect ? "package-meta" : "package-meta-ok", suspect }];
         }
     }
 }
 
 interface ConfigSuspicious {
-    (path: string, getNew: () => Promise<string | undefined>, getOld: () => Promise<string | undefined>): Promise<string | undefined>;
+    (path: string, getContents: (oid?: string) => Promise<string | undefined>): Promise<string | undefined>;
     [basename: string]: (text: string, oldText?: string) => string | undefined;
 }
-const configSuspicious = <ConfigSuspicious>(async (path, newContents, oldContents) => {
+const configSuspicious = <ConfigSuspicious>(async (path, getContents) => {
     const basename = path.replace(/.*\//, "");
     const checker = configSuspicious[basename];
     if (!checker) return `edited`;
-    const text = await newContents();
+    const text = await getContents();
     // Removing tslint.json, tsconfig.json, package.json and
     // OTHER_FILES.txt is checked by the CI. Specifics are in my commit
     // message.
     if (text === undefined) return undefined;
-    const oldText = await oldContents();
+    const oldText = await getContents("master");
     return checker(text, oldText);
 });
-configSuspicious["package.json"] = () => undefined;
-configSuspicious[".npmignore"] = () => undefined;
+configSuspicious["OTHER_FILES.txt"] = makeChecker(
+    [],
+    urls.otherFilesTxt,
+    { parse: text => text.split(/\r?\n/) }
+);
+configSuspicious["package.json"] = makeChecker(
+    { private: true },
+    urls.packageJson,
+    { ignore: data => {
+        delete data.dependencies;
+        delete data.types;
+        delete data.typesVersions;
+    } }
+);
+configSuspicious["tslint.json"] = makeChecker(
+    { extends: "dtslint/dt.json" },
+    urls.linterJson
+);
 configSuspicious["tsconfig.json"] = makeChecker(
     {
         compilerOptions: {
+            module: "commonjs",
             lib: ["es6"],
             noImplicitAny: true,
             noImplicitThis: true,
@@ -385,14 +367,9 @@ configSuspicious["tsconfig.json"] = makeChecker(
     },
     urls.tsconfigJson,
     { ignore: data => {
-        if (Array.isArray(data.compilerOptions?.lib)) {
-            data.compilerOptions.lib = data.compilerOptions.lib.filter((value: unknown) =>
-                !(typeof value === "string" && value.toLowerCase() === "dom"));
-        }
-        ["baseUrl", "typeRoots", "paths", "jsx", "module"].forEach(k => delete data.compilerOptions[k]);
-        if (typeof data.compilerOptions?.target === "string" && data.compilerOptions.target.toLowerCase() === "es6") {
-            delete data.compilerOptions.target;
-        }
+        data.compilerOptions.lib = data.compilerOptions.lib.filter((value: unknown) =>
+            !(typeof value === "string" && value.toLowerCase() === "dom"));
+        ["baseUrl", "typeRoots", "paths", "jsx"].forEach(k => delete data.compilerOptions[k]);
         delete data.files;
     } }
 );
@@ -441,10 +418,10 @@ function getMergeOfferDate(comments: PR_repository_pullRequest_comments_nodes[],
 function getMergeRequest(comments: PR_repository_pullRequest_comments_nodes[], users: string[], sinceDate: Date) {
     const request = latestComment(comments.filter(comment =>
         users.some(u => comment.author && sameUser(u, comment.author.login))
-        && comment.body.split("\n").some(line => line.trim().toLowerCase().startsWith("ready to merge"))));
+        && comment.body.trim().toLowerCase().startsWith("ready to merge")));
     if (!request) return request;
     const date = new Date(request.createdAt);
-    return date > sinceDate ? { date, user: request.author!.login } : undefined;
+    return date > sinceDate ? { date, user: request.author!.login  } : undefined;
 }
 
 function getReviews(prInfo: PR_repository_pullRequest) {
@@ -510,31 +487,15 @@ function downloadsToPopularityLevel(monthlyDownloads: number): PopularityLevel {
         : "Well-liked by everyone";
 }
 
-export async function getOwnersOfPackage(packageName: string, oid: string, fetchFile: typeof defaultFetchFile): Promise<string[] | null | Error> {
-    const packageJson = `${oid}:types/${packageName}/package.json`;
-    const packageJsonContent = await fetchFile(packageJson, 10240); // grab at most 10k
-    let packageJsonObj;
-    if (packageJsonContent !== undefined) {
-        try {
-            packageJsonObj = JSON.parse(packageJsonContent);
-        } catch (e) {
-            if (e instanceof Error) return new Error(`error parsing owners from package.json: ${e.message}`);
-        }
+export async function getOwnersOfPackage(packageName: string, version: string, fetchFile: typeof defaultFetchFile): Promise<string[] | null | Error> {
+    const indexDts = `${version}:types/${packageName}/index.d.ts`;
+    const indexDtsContent = await fetchFile(indexDts, 10240); // grab at most 10k
+    if (indexDtsContent === undefined) return null;
+    let parsed: HeaderParser.Header;
+    try {
+        parsed = HeaderParser.parseHeaderOrFail(indexDtsContent);
+    } catch (e) {
+        if (e instanceof Error) return new Error(`error parsing owners: ${e.message}`);
     }
-
-    if (!packageJsonObj || !(packageJsonObj.name && packageJsonObj.version && packageJsonObj.owners)) {
-        // If we see that we're not in a post-pnpm world, try to get the owners from the index.d.ts.
-        const indexDts = `${oid}:types/${packageName}/index.d.ts`;
-        const indexDtsContent = await fetchFile(indexDts, 10240); // grab at most 10k
-        if (indexDtsContent === undefined) return null;
-        let parsed: OldHeaderParser.Header;
-        try {
-            parsed = OldHeaderParser.parseHeaderOrFail(indexDts, indexDtsContent);
-        } catch (e) {
-            if (e instanceof Error) return new Error(`error parsing owners: ${e.message}`);
-        }
-        return noNullish(parsed!.contributors.map(c => c.githubUsername));
-    }
-
-    return noNullish(packageJsonObj.owners?.map((c: any) => c?.githubUsername));
+    return noNullish(parsed!.contributors.map(c => c.githubUsername));
 }
